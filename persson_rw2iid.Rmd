@@ -1,0 +1,460 @@
+---
+title: "A random walk model of Persson et al data"
+output:
+  html_document:
+    df_print: paged
+---
+
+This is a rough reanalysis of Persson et al (2016)'s analysis of the ICCS2009 data. Comments and citations will be added later.
+
+```{r setup}
+library(foreign)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(cmdstanr)
+library(HDInterval)
+library(posterior)
+
+library(ggplot2)
+theme_set(theme_classic())
+
+options(mc.cores = 4)
+```
+
+Functions for scaling the IGMRFs. Functions `rw1_scale()` and `rw2_scale()` based on https://mc-stan.org/users/documentation/case-studies/icar_stan.html
+
+```{r}
+rw2_Q <- function(n) {
+  if(n < 4)
+    stop("Random walk must contain 4 or more points.")
+  
+  m <- Matrix::Diagonal(n)
+  Matrix::diag(m) <- c(1, 5, rep(6, n-4), 5, 1)
+  m[row(m) - col(m) == 1] <- m[row(m) - col(m) == -1] <- c(-2, rep(-4, n-3), -2)
+  m[abs(row(m) - col(m)) == 2] <- 1
+  
+  return(m)
+}
+
+rw2_scale <- function(n, pc = NULL) {
+  Q <- rw2_Q(n)
+  
+  Q_pert <- Q + Matrix::Diagonal(n) * max(Matrix::diag(Q)) * sqrt(.Machine$double.eps)  # usual perturbation
+
+  if(is.null(pc)) {
+    Q_inv <- INLA::inla.qinv(Q_pert, constr = list(A = matrix(c(1:nrow(Q), rep(1, nrow(Q))), nrow = 2), e = c(0, 0)))
+  } else {
+    temp <- rep(0, nrow(Q))
+    temp[pc] <- 1
+    Q_inv <- INLA::inla.qinv(
+      Q_pert,
+      constr = list(A = matrix(c(1:nrow(Q), rep(1, nrow(Q)), temp), nrow = 3), e = c(0, 0, 0))
+    )
+  }
+
+  exp(mean(log(Matrix::diag(Q_inv))))  # geometric mean of the variances ("generalized variance")
+}
+
+rw1_Q <- function(n) {
+  if(n < 2)
+    stop("Random walk must contain 2 or more points.")
+  
+  m <- Matrix::Diagonal(n)
+  Matrix::diag(m) <- c(1, rep(2, n-2), 1)
+  m[abs(row(m) - col(m)) == 1] <- -1
+  
+  return(m)
+}
+
+rw1_scale <- function(n, pc = NULL) {
+  Q <- rw1_Q(n)
+  
+  Q_pert <- Q + Matrix::Diagonal(n) * max(Matrix::diag(Q)) * sqrt(.Machine$double.eps)  # usual perturbation
+  
+  if(is.null(pc)) {
+    Q_inv <- INLA::inla.qinv(Q_pert, constr = list(A = matrix(rep(1, nrow(Q)), nrow = 1), e = 0))
+  } else {
+    temp <- rep(0, nrow(Q))
+    temp[pc] <- 1
+    Q_inv <- INLA::inla.qinv(Q_pert, constr = list(A = matrix(c(rep(1, nrow(Q)), temp), nrow = 2), e = c(0, 0)))
+  }
+
+  exp(mean(log(Matrix::diag(Q_inv))))  # geometric mean of the variances ("generalized variance")
+}
+
+rw1_scale(24)
+rw1_scale(24, 13)  # with point constraint on 13th point
+rw2_scale(24)
+rw2_scale(24, 13)  # with point constraint on 13th point
+```
+
+# Importing ICCS2009 data
+
+We process the data as in Persson et al (2016). I wrote this a year ago and should probably rewrite it more concisely.
+
+```{r}
+grc8 <- read.spss(
+  "D:\\Data\\ICCS2009_IDB_SPSS\\Data_G8\\ISGGRCC2.sav",
+  add.undeclared.levels = "no",
+  to.data.frame = TRUE
+)
+nor8 <- read.spss(
+  "D:\\Data\\ICCS2009_IDB_SPSS\\Data_G8\\ISGNORC2.sav",
+  add.undeclared.levels = "no",
+  to.data.frame = TRUE
+)
+svn8 <- read.spss(
+  "D:\\Data\\ICCS2009_IDB_SPSS\\Data_G8\\ISGSVNC2.sav",
+  add.undeclared.levels = "no",
+  to.data.frame = TRUE
+)
+grc9 <- read.spss(
+  "D:\\Data\\ICCS2009_IDB_SPSS\\Data_G9\\JSGGRCC2.sav",
+  add.undeclared.levels = "no",
+  to.data.frame = TRUE
+)
+nor9 <- read.spss(
+  "D:\\Data\\ICCS2009_IDB_SPSS\\Data_G9\\JSGNORC2.sav",
+  add.undeclared.levels = "no",
+  to.data.frame = TRUE
+)
+svn9 <- read.spss(
+  "D:\\Data\\ICCS2009_IDB_SPSS\\Data_G9\\JSGSVNC2.sav",
+  add.undeclared.levels = "no",
+  to.data.frame = TRUE
+)
+iccs8 <- rbind(grc8, nor8, svn8)
+iccs9 <- rbind(grc9, nor9, svn9)
+df8 <- data.frame(
+  nwlciv = iccs8$NWLCIV,
+  birth_month = -round(12 * (iccs8$ITDATEY + iccs8$ITDATEM/12 - iccs8$SAGE - 1995)),
+  country = c(
+    rep("Greece", nrow(grc8)),
+    rep("Norway", nrow(nor8)),
+    rep("Slovenia", nrow(svn8))
+  )
+)
+df8$grade9 <- rep(0, nrow(df8))
+df9 <- data.frame(
+  nwlciv = iccs9$NWLCIV,
+  birth_month = -round(12 * (iccs9$ITDATEY + iccs9$ITDATEM/12 - iccs9$SAGE - 1995)),
+  country = c(
+    rep("Greece", nrow(grc9)),
+    rep("Norway", nrow(nor9)),
+    rep("Slovenia", nrow(svn9))
+  )
+)
+df9$grade9 <- rep(1, nrow(df9))
+
+# Sweden
+iccs8S <- read.spss(
+  "D:\\Data\\ICCS2009_IDB_SPSS\\Data_G8\\ISGSWEC2.sav",
+  add.undeclared.levels = "no",
+  to.data.frame = TRUE
+)
+iccs9S <- read.spss(
+  "D:\\Data\\ICCS2009_IDB_SPSS\\Data_G9\\JSGSWEC2.sav",
+  add.undeclared.levels = "no",
+  to.data.frame = TRUE
+)
+df8S <- data.frame(
+  nwlciv = iccs8S$NWLCIV,
+  birth_month = -round(12 * (iccs8S$ITDATEY + iccs8S$ITDATEM/12 - iccs8S$SAGE - 1994)),
+  country = rep("Sweden", nrow(iccs8S))
+)
+df8S$grade9 <- rep(0, nrow(df8S))
+df9S <- data.frame(
+  nwlciv = iccs9S$NWLCIV,
+  birth_month = -round(12 * (iccs9S$ITDATEY + iccs9S$ITDATEM/12 - iccs9S$SAGE - 1994)),
+  country = rep("Sweden", nrow(iccs9S))
+)
+df9S$grade9 <- rep(1, nrow(df9S))
+
+# combine data
+df <- 
+  rbind( df8, df9, df8S, df9S ) %>% 
+  filter(
+    !is.na(country),
+    !is.na(nwlciv),
+    birth_month <= 11,
+    birth_month >= -12
+  ) %>% 
+  mutate( cutoff = ifelse(birth_month < 0, 0, 1) ) %>% 
+  filter( grade9 == cutoff ) %>% 
+  select( -cutoff )
+attr(df$nwlciv, "value.labels") <- NULL
+attr(df$birth_month, "value.labels") <- NULL
+str(df)
+```
+
+Pick a single country.
+
+```{r}
+df_country <- 
+  df %>% 
+  filter(country == "Sweden") %>% 
+  mutate(month_id = birth_month - min(birth_month) + 1) %>% 
+  mutate(across(c(grade9, month_id), as.integer))
+
+df_country
+```
+
+```{r}
+df_country %>% 
+  ggplot() +
+  geom_point(aes(x = birth_month, y = nwlciv), alpha = 0.1)
+```
+
+Prep the data for the aggregate-Gaussian likelihood.
+
+```{r}
+df_agg <- 
+  df_country %>% 
+  group_by(birth_month, month_id, grade9) %>% 
+  summarise(
+    nwlciv_m = mean(nwlciv),
+    nwlciv_v = var(nwlciv),
+    students = n(),
+    .groups = "drop"
+  )
+
+df_agg
+```
+
+```{r}
+rw_mod <- cmdstan_model("rw2iid_pc_aggnormal.stan")
+```
+
+```{r}
+scaling_factor <- rw2_scale(max(df_agg$month_id), 13)
+
+fit <- rw_mod$sample(
+  data = list(
+    N_data = nrow(df_agg),
+    x = df_agg$birth_month,
+    y_m = df_agg$nwlciv_m,
+    y_v = df_agg$nwlciv_v,
+    y_n = df_agg$students,
+    N_x = max(df_agg$month_id),
+    x_id = df_agg$month_id,
+    grade9 = df_agg$grade9,
+    igmrf_order = 2,
+    scaling_factor = scaling_factor,
+    igmrf_pc = 13,
+    prior_only = 0
+  ),
+  iter_warmup = 1e3,
+  iter_sampling = 1e3,
+  chains = 4,
+  parallel_chains = 4,
+  max_treedepth = 20
+)
+```
+
+```{r}
+fit$summary(c("Intercept", "b_g9", "b_x", "re_scale", "rho", "log_sigma")) %>% 
+  mutate_if(is.numeric, round, 2)
+```
+
+```{r}
+draws <- 
+  fit$draws() %>% 
+  as_draws_df() %>% 
+  merge_chains()
+
+plot(density(draws$re_scale))
+```
+
+```{r}
+plot(density(draws$b_g9))
+```
+
+```{r}
+plot(density(draws$rho, adj = 0.1))
+curve(dbeta(x, 0.5, 0.5), lty = 2, add = TRUE)
+```
+
+```{r}
+month_seq <- min(df_agg$birth_month):max(df_agg$birth_month)
+
+draws %>% 
+  subset_draws("mu") %>% 
+  select(-.chain, -.iteration) %>% 
+  pivot_longer(-.draw, names_to = "month", values_to = "mu") %>% 
+  mutate(
+    month = month %>% stringr::str_remove_all("[^0-9]") %>% as.integer(),
+    month = month_seq[month]
+  ) %>% 
+  filter(.draw %in% sample(1:max(.draw), 200)) %>% 
+  ggplot() +
+  geom_line(aes(month, mu, group = .draw), alpha = 0.2)
+```
+
+```{r}
+mu <- 
+  draws %>% 
+  subset_draws("mu") %>% 
+  select(-.chain, -.iteration, -.draw)
+
+mu_smry <- tibble(
+  mu_mean = apply(mu, 2, mean),
+  mu_l = apply(mu, 2, hdi)[1,],
+  mu_u = apply(mu, 2, hdi)[2,],
+  birth_month = month_seq
+)
+
+mu_smry
+```
+
+```{r}
+ggplot() +
+  geom_point(data = mu_smry, aes(birth_month, mu_mean), size = 4, color = "blue", alpha = 0.7) +
+  geom_segment(
+    data = mu_smry,
+    aes(x = birth_month, xend = birth_month, y = mu_l, yend = mu_u),
+    size = 2,
+    color = "blue",
+    alpha = 0.7
+  )
+```
+
+Just the IGMRF component:
+
+```{r}
+month_id_seq <- seq_along(month_seq)
+
+igmrf <- 
+  draws %>% 
+  subset_draws("igmrf") %>% 
+  select(-.chain, -.iteration, -.draw)
+
+mu_i <- sapply(
+  month_id_seq,
+  function(m)
+    draws$re_scale*(sqrt(draws$rho/scaling_factor)*pull(igmrf, m))
+)
+
+mu_smry_i <- tibble(
+  mu_mean = apply(mu_i, 2, mean),
+  mu_l = apply(mu_i, 2, hdi)[1,],
+  mu_u = apply(mu_i, 2, hdi)[2,],
+  birth_month = month_seq
+)
+
+ggplot() +
+  geom_point(data = mu_smry_i, aes(birth_month, mu_mean), size = 4, color = "blue", alpha = 0.7) +
+  geom_segment(
+    data = mu_smry_i,
+    aes(x = birth_month, xend = birth_month, y = mu_l, yend = mu_u),
+    size = 2,
+    color = "blue",
+    alpha = 0.7
+  )
+```
+
+Heterogeneous only:
+
+```{r}
+hetero <- 
+  draws %>% 
+  subset_draws("hetero") %>% 
+  select(-.chain, -.iteration, -.draw)
+
+mu_h <- sapply(
+  month_id_seq,
+  function(m)
+    draws$re_scale*(sqrt(1 - draws$rho)*pull(hetero, m))
+)
+
+mu_smry_h <- tibble(
+  mu_mean = apply(mu_h, 2, mean),
+  mu_l = apply(mu_h, 2, hdi)[1,],
+  mu_u = apply(mu_h, 2, hdi)[2,],
+  birth_month = month_seq
+)
+
+ggplot() +
+  geom_point(data = mu_smry_h, aes(birth_month, mu_mean), size = 4, color = "blue", alpha = 0.7) +
+  geom_segment(
+    data = mu_smry_h,
+    aes(x = birth_month, xend = birth_month, y = mu_l, yend = mu_u),
+    size = 2,
+    color = "blue",
+    alpha = 0.7
+  )
+```
+
+Fit against sample means of the data:
+
+```{r fig.width=9}
+ggplot() +
+  geom_point(data = mu_smry, aes(birth_month, mu_mean), size = 4, color = "blue", alpha = 0.7) +
+  geom_segment(
+    data = mu_smry,
+    aes(x = birth_month, xend = birth_month, y = mu_l, yend = mu_u),
+    size = 2,
+    color = "blue",
+    alpha = 0.7
+  ) +
+  geom_point(data = df_agg, aes(birth_month, nwlciv_m)) +
+  geom_segment(
+    data = df_agg,
+    aes(
+      x = birth_month,
+      xend = birth_month,
+      y = nwlciv_m - 2*sqrt(nwlciv_v)/sqrt(students),
+      yend = nwlciv_m + 2*sqrt(nwlciv_v)/sqrt(students)
+    )
+  )
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
