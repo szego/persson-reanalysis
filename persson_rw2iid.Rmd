@@ -11,6 +11,7 @@ This is a rough reanalysis of Persson et al (2016)'s analysis of the ICCS2009 da
 library(foreign)
 library(dplyr)
 library(tidyr)
+library(purrr)
 library(lubridate)
 library(cmdstanr)
 library(HDInterval)
@@ -111,101 +112,46 @@ rw2_scale(24, 13)
 
 # Importing ICCS2009 data
 
-We process the data as in Persson et al (2016). I wrote this a year ago and should probably rewrite it more concisely.
+We process the data as in Persson et al (2016).
 
 ```{r}
-grc8 <- read.spss(
-  "D:\\Data\\ICCS2009_IDB_SPSS\\Data_G8\\ISGGRCC2.sav",
-  add.undeclared.levels = "no",
-  to.data.frame = TRUE
-)
-nor8 <- read.spss(
-  "D:\\Data\\ICCS2009_IDB_SPSS\\Data_G8\\ISGNORC2.sav",
-  add.undeclared.levels = "no",
-  to.data.frame = TRUE
-)
-svn8 <- read.spss(
-  "D:\\Data\\ICCS2009_IDB_SPSS\\Data_G8\\ISGSVNC2.sav",
-  add.undeclared.levels = "no",
-  to.data.frame = TRUE
-)
-grc9 <- read.spss(
-  "D:\\Data\\ICCS2009_IDB_SPSS\\Data_G9\\JSGGRCC2.sav",
-  add.undeclared.levels = "no",
-  to.data.frame = TRUE
-)
-nor9 <- read.spss(
-  "D:\\Data\\ICCS2009_IDB_SPSS\\Data_G9\\JSGNORC2.sav",
-  add.undeclared.levels = "no",
-  to.data.frame = TRUE
-)
-svn9 <- read.spss(
-  "D:\\Data\\ICCS2009_IDB_SPSS\\Data_G9\\JSGSVNC2.sav",
-  add.undeclared.levels = "no",
-  to.data.frame = TRUE
-)
-iccs8 <- rbind(grc8, nor8, svn8)
-iccs9 <- rbind(grc9, nor9, svn9)
-df8 <- data.frame(
-  nwlciv = iccs8$NWLCIV,
-  birth_month = -round(12 * (iccs8$ITDATEY + iccs8$ITDATEM/12 - iccs8$SAGE - 1995)),
-  country = c(
-    rep("Greece", nrow(grc8)),
-    rep("Norway", nrow(nor8)),
-    rep("Slovenia", nrow(svn8))
-  )
-)
-df8$grade9 <- rep(0, nrow(df8))
-df9 <- data.frame(
-  nwlciv = iccs9$NWLCIV,
-  birth_month = -round(12 * (iccs9$ITDATEY + iccs9$ITDATEM/12 - iccs9$SAGE - 1995)),
-  country = c(
-    rep("Greece", nrow(grc9)),
-    rep("Norway", nrow(nor9)),
-    rep("Slovenia", nrow(svn9))
-  )
-)
-df9$grade9 <- rep(1, nrow(df9))
+countries <- c("greece", "sweden", "norway", "slovenia") %>% sort()
 
-# Sweden
-iccs8S <- read.spss(
-  "D:\\Data\\ICCS2009_IDB_SPSS\\Data_G8\\ISGSWEC2.sav",
-  add.undeclared.levels = "no",
-  to.data.frame = TRUE
-)
-iccs9S <- read.spss(
-  "D:\\Data\\ICCS2009_IDB_SPSS\\Data_G9\\JSGSWEC2.sav",
-  add.undeclared.levels = "no",
-  to.data.frame = TRUE
-)
-df8S <- data.frame(
-  nwlciv = iccs8S$NWLCIV,
-  birth_month = -round(12 * (iccs8S$ITDATEY + iccs8S$ITDATEM/12 - iccs8S$SAGE - 1994)),
-  country = rep("Sweden", nrow(iccs8S))
-)
-df8S$grade9 <- rep(0, nrow(df8S))
-df9S <- data.frame(
-  nwlciv = iccs9S$NWLCIV,
-  birth_month = -round(12 * (iccs9S$ITDATEY + iccs9S$ITDATEM/12 - iccs9S$SAGE - 1994)),
-  country = rep("Sweden", nrow(iccs9S))
-)
-df9S$grade9 <- rep(1, nrow(df9S))
-
-# combine data
 df <- 
-  rbind( df8, df9, df8S, df9S ) %>% 
-  filter(
-    !is.na(country),
-    !is.na(nwlciv),
-    birth_month <= 11,
-    birth_month >= -12
+  crossing(grade = c(8, 9), country = countries) %>% 
+  mutate(
+    file_loc = paste0(
+      "D:/Data/ICCS2009_IDB_SPSS/Data_G",
+      grade, "/",
+      if_else(grade == 8, "ISG", "JSG"),
+      case_when(
+        country == "greece" ~ "GRC",
+        country == "norway" ~ "NOR",
+        country == "slovenia" ~ "SVN",
+        country == "sweden" ~ "SWE"
+      ),
+      "C2.sav"
+    ),
+    data = map(
+      file_loc,
+      ~ read.spss(.x, add.undeclared.levels = "no", to.data.frame = TRUE) %>% 
+        select(NWLCIV, ITDATEY, ITDATEM, SAGE)
+    )
   ) %>% 
-  mutate( cutoff = ifelse(birth_month < 0, 0, 1) ) %>% 
-  filter( grade9 == cutoff ) %>% 
-  select( -cutoff )
-attr(df$nwlciv, "value.labels") <- NULL
-attr(df$birth_month, "value.labels") <- NULL
-str(df)
+  unnest(data) %>% 
+  mutate(
+    g9_year = if_else(country == "sweden", 1994, 1995),
+    birth_month = -round(12 * (ITDATEY + ITDATEM/12 - SAGE - g9_year)),
+    grade9 = if_else(grade == 9, 1, 0),
+    cutoff = if_else(birth_month < 0, 0, 1)
+  ) %>% 
+  drop_na() %>% 
+  filter(birth_month <= 11, birth_month >= -12, grade9 == cutoff) %>% 
+  mutate(month_id = as.integer(birth_month - min(birth_month) + 1)) %>% 
+  select(-c(grade, file_loc, ITDATEY, ITDATEM, SAGE, g9_year, cutoff)) %>% 
+  rename(nwlciv = NWLCIV)
+
+glimpse(df)
 ```
 
 Pick a single country.
