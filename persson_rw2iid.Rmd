@@ -43,17 +43,27 @@ rw2_scale <- function(n, pc = NULL) {
   Q_pert <- Q + Matrix::Diagonal(n) * max(Matrix::diag(Q)) * sqrt(.Machine$double.eps)  # usual perturbation
 
   if(is.null(pc)) {
-    Q_inv <- INLA::inla.qinv(Q_pert, constr = list(A = matrix(c(1:nrow(Q), rep(1, nrow(Q))), nrow = 2), e = c(0, 0)))
+    Q_inv <- INLA::inla.qinv(
+      Q_pert,
+      constr = list(A = matrix(c(1:n, rep(1, n)), nrow = 2, byrow = TRUE), e = c(0, 0))
+    )
   } else {
-    temp <- rep(0, nrow(Q))
+    temp <- rep(0, n)
     temp[pc] <- 1
     Q_inv <- INLA::inla.qinv(
       Q_pert,
-      constr = list(A = matrix(c(1:nrow(Q), rep(1, nrow(Q)), temp), nrow = 3), e = c(0, 0, 0))
+      constr = list(A = matrix(c(1:n, rep(1, n), temp), nrow = 3, byrow = TRUE), e = c(0, 0, 0))
     )
   }
 
-  exp(mean(log(Matrix::diag(Q_inv))))  # geometric mean of the variances ("generalized variance")
+  Q_diag <- Matrix::diag(Q_inv)
+  Q_diag[pc] <- 0
+  
+  if(any(Q_diag < 0))
+    stop("Covariance matrix not positive definite.")
+  
+  Q_diag <- Q_diag[Q_diag > 0]
+  exp(mean(log(Q_diag)))  # geometric mean of the variances ("generalized variance")
 }
 
 rw1_Q <- function(n) {
@@ -70,23 +80,33 @@ rw1_Q <- function(n) {
 rw1_scale <- function(n, pc = NULL) {
   Q <- rw1_Q(n)
   
-  Q_pert <- Q + Matrix::Diagonal(n) * max(Matrix::diag(Q)) * sqrt(.Machine$double.eps)  # usual perturbation
+  Q_pert <- Q + Matrix::Diagonal(n) * max(Matrix::diag(Q)) * sqrt(.Machine$double.eps)  # usual perturbation'
   
   if(is.null(pc)) {
-    Q_inv <- INLA::inla.qinv(Q_pert, constr = list(A = matrix(rep(1, nrow(Q)), nrow = 1), e = 0))
+    Q_inv <- INLA::inla.qinv(Q_pert, constr = list(A = matrix(rep(1, n), nrow = 1), e = 0))
   } else {
-    temp <- rep(0, nrow(Q))
+    temp <- rep(0, n)
     temp[pc] <- 1
-    Q_inv <- INLA::inla.qinv(Q_pert, constr = list(A = matrix(c(rep(1, nrow(Q)), temp), nrow = 2), e = c(0, 0)))
+    Q_inv <- INLA::inla.qinv(
+      Q_pert,
+      constr = list(A = matrix(c(rep(1, n), temp), nrow = 2, byrow = TRUE), e = c(0, 0))
+    )
   }
-
-  exp(mean(log(Matrix::diag(Q_inv))))  # geometric mean of the variances ("generalized variance")
+  
+  Q_diag <- Matrix::diag(Q_inv)
+  Q_diag[pc] <- 0
+  
+  if(any(Q_diag < 0))
+    stop("Covariance matrix not positive definite.")
+  
+  Q_diag <- Q_diag[Q_diag > 0]
+  exp(mean(log(Q_diag)))  # geometric mean of the variances ("generalized variance")
 }
 
 rw1_scale(24)
-rw1_scale(24, 13)  # with point constraint on 13th point
+rw1_scale(24, 13)
 rw2_scale(24)
-rw2_scale(24, 13)  # with point constraint on 13th point
+rw2_scale(24, 13)
 ```
 
 # Importing ICCS2009 data
